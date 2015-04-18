@@ -78,7 +78,7 @@
 #endif
 
 #if LUA_VERSION_NUM < 502
-#  define luaL_newlib(L,l) (lua_newtable(L), luaL_register(L,NULL,l))
+#  define luaL_newlib(L,l) (lua_newtable(L), luaL_register(L,LFS_LIBNAME,l))
 #endif
 
 /* Define 'strerror' for systems that do not implement it */
