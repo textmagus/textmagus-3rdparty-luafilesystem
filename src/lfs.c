@@ -1,23 +1,22 @@
 /*
 ** LuaFileSystem
-** Copyright Kepler Project 2003 (http://www.keplerproject.org/luafilesystem)
+** Copyright Kepler Project 2003 - 2016 (http://keplerproject.github.io/luafilesystem)
 **
 ** File system manipulation library.
 ** This library offers these functions:
-**   lfs.attributes (filepath [, attributename])
+**   lfs.attributes (filepath [, attributename | attributetable])
 **   lfs.chdir (path)
 **   lfs.currentdir ()
 **   lfs.dir (path)
+**   lfs.link (old, new[, symlink])
 **   lfs.lock (fh, mode)
 **   lfs.lock_dir (path)
 **   lfs.mkdir (path)
 **   lfs.rmdir (path)
 **   lfs.setmode (filepath, mode)
-**   lfs.symlinkattributes (filepath [, attributename]) -- thanks to Sam Roberts
+**   lfs.symlinkattributes (filepath [, attributename])
 **   lfs.touch (filepath [, atime [, mtime]])
 **   lfs.unlock (fh)
-**
-** $Id: lfs.c,v 1.61 2009/07/04 02:10:16 mascarenhas Exp $
 */
 
 #ifndef LFS_DO_NOT_USE_LARGE_FILE
@@ -117,10 +116,10 @@ typedef struct dir_data {
 
 #ifdef _WIN32
  #ifdef __BORLANDC__
-  #define lfs_setmode(L,file,m)   ((void)L, setmode(_fileno(file), m))
+  #define lfs_setmode(file, m)   (setmode(_fileno(file), m))
   #define STAT_STRUCT struct stati64
  #else
-  #define lfs_setmode(L,file,m)   ((void)L, _setmode(_fileno(file), m))
+  #define lfs_setmode(file, m)   (_setmode(_fileno(file), m))
   #define STAT_STRUCT struct _stati64
  #endif
 #define STAT_FUNC _stati64
@@ -128,7 +127,7 @@ typedef struct dir_data {
 #else
 #define _O_TEXT               0
 #define _O_BINARY             0
-#define lfs_setmode(L,file,m)   ((void)L, (void)file, (void)m, 0)
+#define lfs_setmode(file, m)   ((void)file, (void)m, 0)
 #define STAT_STRUCT struct stat
 #define STAT_FUNC stat
 #define LSTAT_FUNC lstat
@@ -197,15 +196,23 @@ static int get_dir (lua_State *L) {
 ** Check if the given element on the stack is a file and returns it.
 */
 static FILE *check_file (lua_State *L, int idx, const char *funcname) {
+#if LUA_VERSION_NUM == 501
         FILE **fh = (FILE **)luaL_checkudata (L, idx, "FILE*");
-        if (fh == NULL) {
-                luaL_error (L, "%s: not a file", funcname);
-                return 0;
-        } else if (*fh == NULL) {
+        if (*fh == NULL) {
                 luaL_error (L, "%s: closed file", funcname);
                 return 0;
         } else
                 return *fh;
+#elif LUA_VERSION_NUM >= 502 && LUA_VERSION_NUM <= 503
+        luaL_Stream *fh = (luaL_Stream *)luaL_checkudata (L, idx, "FILE*");
+        if (fh->closef == 0 || fh->f == NULL) {
+                luaL_error (L, "%s: closed file", funcname);
+                return 0;
+        } else
+                return fh->f;
+#else
+#error unsupported Lua version
+#endif
 }
 
 
@@ -292,7 +299,7 @@ static int lfs_lock_dir(lua_State *L) {
   return 1;
 }
 static int lfs_unlock_dir(lua_State *L) {
-  lfs_Lock *lock = luaL_checkudata(L, 1, LOCK_METATABLE);
+  lfs_Lock *lock = (lfs_Lock *)luaL_checkudata(L, 1, LOCK_METATABLE);
   if(lock->fd != INVALID_HANDLE_VALUE) {    
     CloseHandle(lock->fd);
     lock->fd=INVALID_HANDLE_VALUE;
@@ -325,7 +332,7 @@ static int lfs_lock_dir(lua_State *L) {
   return 1;
 }
 static int lfs_unlock_dir(lua_State *L) {
-  lfs_Lock *lock = luaL_checkudata(L, 1, LOCK_METATABLE);
+  lfs_Lock *lock = (lfs_Lock *)luaL_checkudata(L, 1, LOCK_METATABLE);
   if(lock->ln) {
     unlink(lock->ln);
     free(lock->ln);
@@ -339,25 +346,20 @@ static int lfs_g_setmode (lua_State *L, FILE *f, int arg) {
   static const int mode[] = {_O_BINARY, _O_TEXT};
   static const char *const modenames[] = {"binary", "text", NULL};
   int op = luaL_checkoption(L, arg, NULL, modenames);
-  int res = lfs_setmode(L, f, mode[op]);
+  int res = lfs_setmode(f, mode[op]);
   if (res != -1) {
     int i;
     lua_pushboolean(L, 1);
     for (i = 0; modenames[i] != NULL; i++) {
       if (mode[i] == res) {
         lua_pushstring(L, modenames[i]);
-        goto exit;
+        return 2;
       }
     }
     lua_pushnil(L);
-  exit:
     return 2;
   } else {
-    int en = errno;
-    lua_pushnil(L);
-    lua_pushfstring(L, "%s", strerror(en));
-    lua_pushinteger(L, en);
-    return 3;
+    return pusherror(L, NULL);
   }
 }
 
@@ -423,7 +425,8 @@ static int make_link(lua_State *L)
         return pushresult(L,
                 (lua_toboolean(L,3) ? symlink : link)(oldpath, newpath), NULL);
 #else
-        return pusherror(L, "make_link is not supported on Windows");
+        errno = ENOSYS; /* = "Function not implemented" */
+        return pushresult(L, -1, "make_link is not supported on Windows");
 #endif
 }
 
@@ -808,8 +811,8 @@ static int _file_info_ (lua_State *L, int (*st)(const char*, STAT_STRUCT*)) {
         int i;
 
         if (st(file, &info)) {
-                lua_pushnil (L);
-                lua_pushfstring (L, "cannot obtain information from file `%s'", file);
+                lua_pushnil(L);
+                lua_pushfstring(L, "cannot obtain information from file '%s': %s", file, strerror(errno));
                 return 2;
         }
         if (lua_isstring (L, 2)) {
@@ -822,7 +825,7 @@ static int _file_info_ (lua_State *L, int (*st)(const char*, STAT_STRUCT*)) {
                         }
                 }
                 /* member not found */
-                return luaL_error(L, "invalid attribute name");
+                return luaL_error(L, "invalid attribute name '%s'", member);
         }
         /* creates a table if none is given */
         if (!lua_istable (L, 2)) {
@@ -847,10 +850,57 @@ static int file_info (lua_State *L) {
 
 
 /*
+** Push the symlink target to the top of the stack.
+** Assumes the file name is at position 1 of the stack.
+** Returns 1 if successful (with the target on top of the stack),
+** 0 on failure (with stack unchanged, and errno set).
+*/
+static int push_link_target(lua_State *L) {
+#ifdef _WIN32
+        errno = ENOSYS;
+        return 0;
+#else
+        const char *file = luaL_checkstring(L, 1);
+        char *target = NULL;
+        int tsize, size = 256; /* size = initial buffer capacity */
+        while (1) {
+            target = realloc(target, size);
+            if (!target) /* failed to allocate */
+                return 0;
+            tsize = readlink(file, target, size);
+            if (tsize < 0) { /* a readlink() error occurred */
+                free(target);
+                return 0;
+            }
+            if (tsize < size)
+                break;
+            /* possibly truncated readlink() result, double size and retry */
+            size *= 2;
+        }
+        target[tsize] = '\0';
+        lua_pushlstring(L, target, tsize);
+        free(target);
+        return 1;
+#endif
+}
+
+/*
 ** Get symbolic link information using lstat.
 */
 static int link_info (lua_State *L) {
-        return _file_info_ (L, LSTAT_FUNC);
+        int ret;
+        if (lua_isstring (L, 2) && (strcmp(lua_tostring(L, 2), "target") == 0)) {
+                int ok = push_link_target(L);
+                return ok ? 1 : pusherror(L, "could not obtain link target");
+        }
+        ret = _file_info_ (L, LSTAT_FUNC);
+        if (ret == 1 && lua_type(L, -1) == LUA_TTABLE) {
+                int ok = push_link_target(L);
+                if (ok) {
+                        lua_setfield(L, -2, "target");
+                }
+        }
+        return ret;
 }
 
 
@@ -858,15 +908,12 @@ static int link_info (lua_State *L) {
 ** Assumes the table is on top of the stack.
 */
 static void set_info (lua_State *L) {
-        lua_pushliteral (L, "_COPYRIGHT");
-        lua_pushliteral (L, "Copyright (C) 2003-2012 Kepler Project");
-        lua_settable (L, -3);
-        lua_pushliteral (L, "_DESCRIPTION");
-        lua_pushliteral (L, "LuaFileSystem is a Lua library developed to complement the set of functions related to file systems offered by the standard Lua distribution");
-        lua_settable (L, -3);
-        lua_pushliteral (L, "_VERSION");
-        lua_pushliteral (L, "LuaFileSystem "LFS_VERSION);
-        lua_settable (L, -3);
+  lua_pushliteral(L, "Copyright (C) 2003-2016 Kepler Project");
+  lua_setfield(L, -2, "_COPYRIGHT");
+  lua_pushliteral(L, "LuaFileSystem is a Lua library developed to complement the set of functions related to file systems offered by the standard Lua distribution");
+  lua_setfield(L, -2, "_DESCRIPTION");
+  lua_pushliteral(L, "LuaFileSystem " LFS_VERSION);
+  lua_setfield(L, -2, "_VERSION");
 }
 
 
@@ -887,7 +934,7 @@ static const struct luaL_Reg fslib[] = {
         {NULL, NULL},
 };
 
-int luaopen_lfs (lua_State *L) {
+LFS_EXPORT int luaopen_lfs (lua_State *L) {
         dir_create_meta (L);
         lock_create_meta (L);
         luaL_newlib (L, fslib);
