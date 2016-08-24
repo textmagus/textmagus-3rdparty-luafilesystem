@@ -857,6 +857,7 @@ static int file_info (lua_State *L) {
 */
 static int push_link_target(lua_State *L) {
 #ifdef _WIN32
+        (void)L; /* UNUSED */
         errno = ENOSYS;
         return 0;
 #else
